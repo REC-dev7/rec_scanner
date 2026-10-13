@@ -1,0 +1,1268 @@
+// REC Scan — continuous scan-list-export tool.
+// Standalone, offline-first: no server, no network calls. Everything (the
+// scanned list, the Excel file) is produced entirely in this browser tab.
+
+const SPLASH_START = performance.now();
+const SPLASH_MIN_MS = 600; // avoids a flash-then-instant-hide on a fast/cached load
+
+// Staff sign-in gate — Google Identity Services, not Firebase: this is just
+// a login gate (who's allowed to open the scanner), not the roster-sync
+// feature, so there's no need for a backend or a Firebase project at all.
+// Restricted to the college domain via the `hd` (hosted domain) request
+// param + a client-side re-check of the token's own `hd`/email claim — a
+// soft gate, not a security boundary (same spirit as the staff PIN above:
+// nothing sensitive is actually stored server-side to protect). The ID
+// token is decoded but never signature-verified, since there's no backend
+// to verify against and nothing here depends on that guarantee.
+//
+// Same OAuth Client ID Project 1 uses (a public value — P1 serves it to every
+// visitor at /api/auth/config). Google only honors it from origins listed
+// under "Authorized JavaScript origins" for that client in Google Cloud
+// Console (APIs & Services -> Credentials), so this site's origin must be
+// added there too, or sign-in fails with an origin_mismatch error.
+const GOOGLE_CLIENT_ID = '194459417743-6idjf0kcccrql1k5i3t4mhdki540lkkb.apps.googleusercontent.com';
+const ALLOWED_EMAIL_DOMAIN = 'rajalakshmi.edu.in';
+// Sign-in is for staff only. Student addresses look like name.initials.YYYY.dept@college and
+// staff addresses are just name@college, so anything with a ".YYYY." batch segment before the @
+// is turned away. The owner's own account is the one student-style address let in.
+const OWNER_EMAIL = 'ravisankar.mr.2024.cse@rajalakshmi.edu.in';
+const looksLikeStudent = (email) => /[.]20[0-9][0-9][.]/.test(String(email).split('@')[0]);
+const accountAllowed = (email) => email === OWNER_EMAIL || !looksLikeStudent(email);
+const LOGIN_KEY = 'rollcall_user_v1';
+
+const READER_ID = 'reader';
+const DUPLICATE_COOLDOWN_MS = 1500; // ignore the same code re-firing while still in frame
+const STORAGE_KEY = 'rollcall_state_v1';
+const ROSTER_KEY = 'rollcall_roster_v1';
+const TRIAL_ACTIVE_KEY = 'rollcall_trial_active_v1';
+const CLASSES_KEY = 'rollcall_classes_v1';
+// Staff -> classes come from Firestore (see FIREBASE-ROSTER-PLAN.md), project
+// "rec-scan". These values are public identifiers, not secrets: Firebase
+// protects the data with firebase/firestore.rules, not by hiding this config.
+const FIREBASE_CONFIG = {
+  apiKey: 'AIzaSyDrjAGuBUqtJbRXWDa7AVw7Jn8OyK4bGoA',
+  authDomain: 'rec-scan.firebaseapp.com',
+  projectId: 'rec-scan',
+  storageBucket: 'rec-scan.firebasestorage.app',
+  messagingSenderId: '399324732813',
+  appId: '1:399324732813:web:fe3e9aa487b3d313c6b1c4',
+};
+const FIREBASE_SDK_VERSION = '13.0.0';
+// TEMPORARY trial class for the staff demo: a staff account with no classes of its own gets
+// this one class so there is something to scan. Needs the matching "allow get" block in
+// firebase/firestore.rules. It stops being offered, and is dropped from phones, on TRIAL_UNTIL.
+const TRIAL_CLASS_ID = 'CB23F35__CSE_2024_Group_1';
+const TRIAL_UNTIL = '2026-10-16';
+const pastDate = (isoDay) => new Date() >= new Date(isoDay + 'T00:00:00');
+// Roll numbers are always "24" + 7 digits (e.g. 240701424) — only the first
+// two digits are fixed, the other 7 vary per year/department/student.
+// Applied to scans too, so a misread barcode can't land in the list.
+const ROLL_NO_RE = /^24\d{7}$/;
+
+let scanner = null;
+let scanning = false;
+const rows = []; // { rollNo, scannedAt: Date }
+const seenRollNos = new Set();
+let dupeCount = 0;
+const dupeLog = []; // { rollNo, at: Date } — which roll numbers actually got flagged, not just a bare count
+let lastDecoded = { text: null, at: 0 };
+const roster = new Map(); // rollNo -> name, loaded separately from the scan session (see ROSTER_KEY)
+// True only when the Trial Class 1 roster was explicitly loaded — while true,
+// a roll number not on that roster is rejected outright (this is a real,
+// known class, so an unrelated ID shouldn't end up in its roll call). A
+// custom pasted roster does NOT set this — it stays name-only/no-blocking,
+// same as before, since that's typed by the teacher and may be incomplete.
+let trialActive = false;
+let activeClassLabel = 'Trial Class 1'; // name shown in rejection messages; the class picked from the list, or the bundled trial class
+let myClasses = []; // this staff member's classes (cached from Firestore)
+
+// Everything lived only in a JS variable — a reload, an accidentally-closed
+// tab, or the OS killing a backgrounded tab (common on both Android and iOS
+// once you switch away to check something else) wiped the whole scanned
+// list with no way back. Persisted to localStorage on every change instead,
+// so the list survives all of that and is only ever gone when "Clear list"
+// is used on purpose.
+function saveState() {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({
+      rows: rows.map((r) => ({ rollNo: r.rollNo, scannedAt: r.scannedAt.toISOString() })),
+      dupeCount,
+      dupeLog: dupeLog.map((d) => ({ rollNo: d.rollNo, at: d.at.toISOString() })),
+    }));
+  } catch { /* storage full/unavailable — scanning still works, just unsaved */ }
+}
+
+function loadState() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return;
+    const saved = JSON.parse(raw);
+    for (const r of saved.rows || []) {
+      const scannedAt = new Date(r.scannedAt);
+      if (!r.rollNo || Number.isNaN(scannedAt.getTime())) continue; // skip corrupt entries, don't crash the whole restore
+      rows.push({ rollNo: r.rollNo, scannedAt });
+      seenRollNos.add(r.rollNo);
+    }
+    dupeCount = Number(saved.dupeCount) || 0;
+    for (const d of saved.dupeLog || []) {
+      const at = new Date(d.at);
+      if (!d.rollNo || Number.isNaN(at.getTime())) continue;
+      dupeLog.push({ rollNo: d.rollNo, at });
+    }
+  } catch { /* corrupt/unavailable storage — start fresh rather than crash */ }
+}
+
+// Roster is separate from the scan session on purpose — a teacher loads it
+// once for a class and it should survive "Clear list" between periods/days,
+// only going away via its own "Clear roster".
+function saveRoster() {
+  try { localStorage.setItem(ROSTER_KEY, JSON.stringify([...roster])); } catch { /* not critical */ }
+}
+function loadRoster() {
+  try {
+    const raw = localStorage.getItem(ROSTER_KEY);
+    if (!raw) return;
+    for (const [rollNo, name] of JSON.parse(raw)) {
+      if (typeof rollNo === 'string') roster.set(rollNo, typeof name === 'string' ? name : '');
+    }
+  } catch { /* corrupt/unavailable — start with no roster rather than crash */ }
+}
+function saveTrialActive() {
+  try { localStorage.setItem(TRIAL_ACTIVE_KEY, trialActive ? activeClassLabel : ''); } catch { /* not critical */ }
+}
+function loadTrialActive() {
+  try {
+    const v = localStorage.getItem(TRIAL_ACTIVE_KEY) || '';
+    trialActive = v !== '';
+    if (v && v !== '1') activeClassLabel = v;
+  } catch { trialActive = false; }
+}
+
+const els = {
+  startBtn: document.getElementById('start-btn'),
+  stopBtn: document.getElementById('stop-btn'),
+  torchBtn: document.getElementById('torch-btn'),
+  status: document.getElementById('scan-status'),
+  count: document.getElementById('count'),
+  dupeCountEl: document.getElementById('dupe-count'),
+  list: document.getElementById('roll-list'),
+  exportBtn: document.getElementById('export-btn'),
+  exportFilename: document.getElementById('export-filename'),
+  clearBtn: document.getElementById('clear-btn'),
+  manualToggle: document.getElementById('manual-toggle'),
+  manualEntry: document.getElementById('manual-entry'),
+  manualInput: document.getElementById('manual-input'),
+  manualAddBtn: document.getElementById('manual-add-btn'),
+  dupeToggle: document.getElementById('dupe-toggle'),
+  dupeList: document.getElementById('dupe-list'),
+  countLabel: document.getElementById('count-label'),
+  rosterToggle: document.getElementById('roster-toggle'),
+  rosterSection: document.getElementById('roster-section'),
+  rosterClearBtn: document.getElementById('roster-clear-btn'),
+  rosterStatus: document.getElementById('roster-status'),
+  absentCard: document.getElementById('absent-card'),
+  absentList: document.getElementById('absent-list'),
+  absentCount: document.getElementById('absent-count'),
+};
+
+// Custom confirm()/prompt() replacement — matches the app's theme instead of
+// the browser's native dialog. Same call shape: askConfirm resolves
+// true/false, askPrompt resolves the typed string or null on cancel.
+const modalEls = {
+  overlay: document.getElementById('modal-overlay'),
+  message: document.getElementById('modal-message'),
+  input: document.getElementById('modal-input'),
+  ok: document.getElementById('modal-ok'),
+  cancel: document.getElementById('modal-cancel'),
+};
+function openModal({ message, withInput, defaultValue }) {
+  return new Promise((resolve) => {
+    modalEls.message.textContent = message;
+    modalEls.input.style.display = withInput ? 'block' : 'none';
+    modalEls.input.value = withInput ? (defaultValue || '') : '';
+    modalEls.overlay.style.display = 'flex';
+    if (withInput) modalEls.input.focus();
+
+    const cleanup = () => {
+      modalEls.overlay.style.display = 'none';
+      modalEls.ok.removeEventListener('click', onOk);
+      modalEls.cancel.removeEventListener('click', onCancel);
+      modalEls.input.removeEventListener('keydown', onKey);
+    };
+    const onOk = () => { cleanup(); resolve(withInput ? modalEls.input.value : true); };
+    const onCancel = () => { cleanup(); resolve(withInput ? null : false); };
+    const onKey = (e) => {
+      if (e.key === 'Enter') onOk();
+      if (e.key === 'Escape') onCancel();
+    };
+    modalEls.ok.addEventListener('click', onOk);
+    modalEls.cancel.addEventListener('click', onCancel);
+    modalEls.input.addEventListener('keydown', onKey);
+  });
+}
+function askConfirm(message) {
+  return openModal({ message, withInput: false });
+}
+function askPrompt(message, defaultValue) {
+  return openModal({ message, withInput: true, defaultValue });
+}
+
+function setStatus(text, kind) {
+  els.status.textContent = text;
+  els.status.className = `status show ${kind}`;
+}
+
+function clearStatus() {
+  els.status.className = 'status';
+}
+
+// Defaults are the short high "added" beep; a rejection uses a long low
+// tone + double buzz so a student scanning on a passed phone notices it
+// without reading the status text.
+// One shared AudioContext, unlocked by the first tap: browsers keep a context created
+// outside a user gesture (e.g. inside the camera's scan callback) suspended = silent.
+let audioCtx = null;
+const clips = {}; // name -> decoded AudioBuffer (recorded loud clips in sounds/, cached offline by sw.js)
+async function loadClip(name) {
+  try {
+    const buf = await (await fetch(`sounds/${name}.wav`)).arrayBuffer();
+    clips[name] = await audioCtx.decodeAudioData(buf);
+  } catch { /* synth beep below is the fallback */ }
+}
+function unlockAudio() {
+  try {
+    if (!audioCtx) {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      loadClip('scan'); loadClip('reject');
+    }
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+  } catch { /* audio not available */ }
+}
+document.addEventListener('pointerdown', unlockAudio);
+document.addEventListener('keydown', unlockAudio);
+
+const BEEP_VOLUME = 0.8; // 1 = full scale (clips are normalized to it); owner found full too loud
+
+// Plays the recorded clip (loudest option: pre-clipped, harmonic-rich); falls back to a
+// synthesized beep if the clip isn't decoded yet.
+function beep(freq = 2500, secs = 0.25, vibration = 60) {
+  try {
+    unlockAudio();
+    const ctx = audioCtx;
+    const clip = clips[freq < 1000 ? 'reject' : 'scan'];
+    if (clip) {
+      const src = ctx.createBufferSource();
+      src.buffer = clip;
+      const vol = ctx.createGain();
+      vol.gain.value = BEEP_VOLUME;
+      src.connect(vol);
+      vol.connect(ctx.destination);
+      src.start();
+    } else {
+      const gain = ctx.createGain();
+      gain.connect(ctx.destination);
+      const t0 = ctx.currentTime;
+      [freq, freq * 1.3].forEach((f, i) => {
+        const osc = ctx.createOscillator();
+        osc.type = 'square';
+        osc.frequency.value = f;
+        osc.connect(gain);
+        osc.start(t0 + i * secs);
+        osc.stop(t0 + i * secs + secs * 0.9);
+      });
+      gain.gain.setValueAtTime(BEEP_VOLUME, t0);
+    }
+  } catch { /* audio not available — silent is fine, not critical */ }
+  if (navigator.vibrate) navigator.vibrate(vibration);
+}
+
+function renderList() {
+  if (rows.length === 0) {
+    els.list.innerHTML = '<li class="empty">No scans yet.</li>';
+  } else {
+    els.list.innerHTML = rows
+      .slice()
+      .reverse()
+      .map((r, i) => {
+        const realIndex = rows.length - 1 - i;
+        const name = roster.get(r.rollNo);
+        return `
+          <li>
+            <span>
+              <span class="roll">${escapeHtml(r.rollNo)}</span>${name ? ` — ${escapeHtml(name)}` : ''}<br/>
+              <span class="time">${r.scannedAt.toLocaleTimeString()}</span>
+            </span>
+            <span class="actions">
+              <button class="remove" data-action="edit" data-index="${realIndex}" title="Edit">✏️</button>
+              <button class="remove" data-action="remove" data-index="${realIndex}" title="Remove">✕</button>
+            </span>
+          </li>`;
+      })
+      .join('');
+  }
+  els.count.textContent = roster.size > 0 ? `${rows.length} / ${roster.size}` : String(rows.length);
+  els.dupeCountEl.textContent = dupeCount;
+  els.exportBtn.disabled = rows.length === 0;
+  // Was tied to rows.length alone — a repeats count could sit stuck at,
+  // say, 1 with an empty list (every scan removed) and Clear had no way
+  // to reach it, since the button was disabled too. Enabled whenever
+  // there's anything at all to clear.
+  els.clearBtn.disabled = rows.length === 0 && dupeCount === 0;
+  renderDupeLog();
+  renderAbsent();
+}
+
+// Only meaningful once a roster is loaded — otherwise there's nothing to
+// compare "who scanned" against, so the whole card stays hidden.
+function renderAbsent() {
+  if (roster.size === 0) {
+    els.absentCard.style.display = 'none';
+    return;
+  }
+  const absent = [...roster.entries()].filter(([rollNo]) => !seenRollNos.has(rollNo));
+  els.absentCard.style.display = 'block';
+  els.absentCount.textContent = absent.length;
+  els.absentList.innerHTML = absent.length === 0
+    ? '<li class="empty">Everyone on the roster has been scanned.</li>'
+    : absent
+        .map(([rollNo, name]) => `
+          <li><span class="roll">${escapeHtml(rollNo)}</span>${name ? ` — ${escapeHtml(name)}` : ''}</li>`)
+        .join('');
+}
+
+function renderDupeLog() {
+  els.dupeList.innerHTML = dupeLog.length === 0
+    ? '<li class="empty">No repeats yet.</li>'
+    : dupeLog
+        .slice()
+        .reverse()
+        .map((d) => `
+          <li>
+            <span class="roll">${escapeHtml(d.rollNo)}</span>
+            <span class="time">${d.at.toLocaleTimeString()}</span>
+          </li>`)
+        .join('');
+}
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+}
+
+els.list.addEventListener('click', (e) => {
+  const btn = e.target.closest('button.remove');
+  if (!btn) return;
+  const idx = Number(btn.dataset.index);
+
+  if (btn.dataset.action === 'edit') {
+    editEntry(idx);
+    return;
+  }
+
+  const removed = rows.splice(idx, 1)[0];
+  if (removed) seenRollNos.delete(removed.rollNo);
+  saveState();
+  renderList();
+});
+
+// For fixing a barcode that scanned/decoded wrong — a mistyped manual entry
+// is just as easily removed and retyped, but a scan is trusted as correct
+// by default, so there was previously no way to correct one without
+// deleting and re-scanning the same card again.
+async function editEntry(idx) {
+  const row = rows[idx];
+  if (!row) return;
+
+  const next = await askPrompt('Edit roll number:', row.rollNo);
+  if (next === null) return; // cancelled
+  const rollNo = next.trim();
+  if (!rollNo || rollNo === row.rollNo) return;
+
+  if (!ROLL_NO_RE.test(rollNo)) {
+    alert('Roll number must be 24 followed by 7 digits (e.g. 240701424).');
+    return;
+  }
+  if (seenRollNos.has(rollNo)) {
+    alert(`${rollNo} is already in the list.`);
+    return;
+  }
+  if (trialActive && !roster.has(rollNo)) {
+    alert(`${rollNo} is not on the ${activeClassLabel} roster.`);
+    return;
+  }
+
+  seenRollNos.delete(row.rollNo);
+  seenRollNos.add(rollNo);
+  row.rollNo = rollNo;
+  saveState();
+  renderList();
+}
+
+function onDecoded(decodedText) {
+  const rollNo = String(decodedText).trim();
+  if (!rollNo) return;
+
+  const now = Date.now();
+  if (lastDecoded.text === rollNo && now - lastDecoded.at < DUPLICATE_COOLDOWN_MS) {
+    return; // same code still sitting in front of the camera — not a new event
+  }
+  lastDecoded = { text: rollNo, at: now };
+
+  // A stray reflection, a logo, or a barcode-like pattern elsewhere on the
+  // card can misdecode into garbage digits — reject anything that isn't a
+  // real roll number instead of silently adding it to the list.
+  if (!ROLL_NO_RE.test(rollNo)) {
+    setStatus(`Scanned "${rollNo}" doesn't look like a roll number — ignored.`, 'err');
+    return;
+  }
+
+  if (seenRollNos.has(rollNo)) {
+    dupeCount++;
+    dupeLog.push({ rollNo, at: new Date() });
+    setStatus(`Already scanned: ${rollNo}`, 'info');
+    saveState();
+    renderList();
+    return;
+  }
+
+  if (trialActive && !roster.has(rollNo)) {
+    beep(600, 0.5, [80, 60, 80]);
+    setStatus(`${rollNo} is not on the ${activeClassLabel} roster — rejected.`, 'err');
+    return;
+  }
+
+  seenRollNos.add(rollNo);
+  rows.push({ rollNo, scannedAt: new Date() });
+  beep();
+  const name = roster.get(rollNo);
+  setStatus(`Added: ${rollNo}${name ? ` — ${name}` : ''}`, 'ok');
+  saveState();
+  renderList();
+}
+
+// Screen Wake Lock — without this, the phone's own screen timeout dims/locks
+// the screen mid-class (idle hands, camera pointed at a card, no touches),
+// which stops the camera stream entirely and forces restarting the scanner.
+// Supported on iOS Safari 16.4+ and effectively every current browser; where
+// it isn't supported, scanning still works exactly as before, just without
+// the extra protection.
+let wakeLock = null;
+async function acquireWakeLock() {
+  if (!('wakeLock' in navigator)) return;
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+  } catch { /* e.g. battery saver mode refusing it — scanning still works, just no lock */ }
+}
+function releaseWakeLock() {
+  if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+}
+// The lock is auto-released whenever the tab is hidden (spec behavior) — if
+// still scanning when the tab becomes visible again, re-request it so a
+// brief app-switch (checking something else) doesn't silently drop the lock
+// for the rest of the class.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && scanning) acquireWakeLock();
+});
+
+// Torch/flashlight — only actually controllable via getUserMedia on some
+// Android/Chromium combinations; iOS Safari doesn't expose it at all, so
+// this button only appears where the running camera track reports the
+// capability, instead of showing a button that would silently do nothing.
+async function updateTorchButton() {
+  els.torchBtn.style.display = 'none';
+  if (!scanner) return;
+  try {
+    const caps = scanner.getRunningTrackCameraCapabilities();
+    if (caps && caps.torchFeature && caps.torchFeature().isSupported()) {
+      els.torchBtn.style.display = 'block';
+      els.torchBtn.dataset.on = 'false';
+      els.torchBtn.textContent = '🔦';
+    }
+  } catch { /* capability check itself unsupported — just skip the button */ }
+}
+async function toggleTorch() {
+  if (!scanner) return;
+  const isOn = els.torchBtn.dataset.on === 'true';
+  try {
+    const caps = scanner.getRunningTrackCameraCapabilities();
+    await caps.torchFeature().apply(!isOn);
+    els.torchBtn.dataset.on = String(!isOn);
+    els.torchBtn.textContent = isOn ? '🔦' : '💡';
+  } catch { /* device refused mid-session — leave state as it was */ }
+}
+
+// Camera zoom: pinch on the camera view, or the slider under it. Only offered where the running
+// camera track reports a zoom range (Android Chrome does; iPhone Safari does not, so there the
+// slider simply never appears). The slider is outside the staff lock, so students can zoom too.
+const zoomEls = { row: document.getElementById('zoom-row'), range: document.getElementById('zoom-range'), reader: document.getElementById(READER_ID) };
+const ZOOM_KEY = 'rollcall_zoom_v1';
+let zoomFeature = null, zoomApplying = false, zoomPending = null;
+
+function pushZoom(v) {                         // one applyConstraints at a time; keep only the newest value
+  if (zoomApplying) { zoomPending = v; return; }
+  zoomApplying = true;
+  zoomFeature.apply(v).catch(() => { /* device refused this value */ }).finally(() => {
+    zoomApplying = false;
+    if (zoomPending !== null) { const p = zoomPending; zoomPending = null; pushZoom(p); }
+  });
+}
+function setZoom(v) {
+  if (!zoomFeature) return;
+  v = Math.min(Number(zoomEls.range.max), Math.max(Number(zoomEls.range.min), v));
+  zoomEls.range.value = v;
+  pushZoom(v);
+  try { localStorage.setItem(ZOOM_KEY, String(v)); } catch { /* not critical */ }
+}
+function setupZoom() {
+  zoomFeature = null; zoomPending = null;
+  zoomEls.row.style.display = 'none';
+  try {
+    const caps = scanner.getRunningTrackCameraCapabilities();
+    const zf = caps && caps.zoomFeature && caps.zoomFeature();
+    if (!zf || !zf.isSupported()) return;
+    const lo = zf.min(), hi = zf.max();
+    if (!(hi > lo)) return;
+    zoomEls.range.min = lo; zoomEls.range.max = hi; zoomEls.range.step = zf.step() || (hi - lo) / 50;
+    zoomFeature = zf;
+    zoomEls.row.style.display = 'flex';
+    let start = NaN;
+    try { start = Number(localStorage.getItem(ZOOM_KEY)); } catch { /* none saved */ }
+    if (!(start >= lo && start <= hi)) start = zf.value() != null ? zf.value() : lo;
+    setZoom(start);
+  } catch { zoomFeature = null; }
+}
+function hideZoom() { zoomFeature = null; zoomEls.row.style.display = 'none'; }
+
+zoomEls.range.addEventListener('input', () => setZoom(Number(zoomEls.range.value)));
+const pinchPointers = new Map();
+let pinch = null;
+const pinchDistance = () => { const [a, b] = [...pinchPointers.values()]; return Math.hypot(a.x - b.x, a.y - b.y); };
+zoomEls.reader.addEventListener('pointerdown', (e) => {
+  pinchPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (pinchPointers.size === 2 && zoomFeature) pinch = { d0: pinchDistance(), z0: Number(zoomEls.range.value) };
+});
+zoomEls.reader.addEventListener('pointermove', (e) => {
+  if (!pinchPointers.has(e.pointerId)) return;
+  pinchPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (pinch && pinchPointers.size === 2 && pinch.d0 > 0) setZoom(pinch.z0 * pinchDistance() / pinch.d0);
+});
+const endPinch = (e) => { pinchPointers.delete(e.pointerId); if (pinchPointers.size < 2) pinch = null; };
+['pointerup', 'pointercancel', 'pointerleave'].forEach((t) => zoomEls.reader.addEventListener(t, endPinch));
+
+async function startScanning() {
+  clearStatus();
+  els.startBtn.disabled = true;
+
+  // Restrict to 1D formats commonly printed on ID cards — narrows what the
+  // decoder looks for each frame, which is both faster and avoids
+  // accidentally treating an unrelated QR code in the room as a scan.
+  const formatsToSupport = [
+    Html5QrcodeSupportedFormats.CODE_128,
+    Html5QrcodeSupportedFormats.CODE_39,
+    Html5QrcodeSupportedFormats.CODE_93,
+    Html5QrcodeSupportedFormats.CODABAR,
+    Html5QrcodeSupportedFormats.EAN_13,
+    Html5QrcodeSupportedFormats.EAN_8,
+    Html5QrcodeSupportedFormats.UPC_A,
+    Html5QrcodeSupportedFormats.UPC_E,
+    Html5QrcodeSupportedFormats.ITF,
+  ];
+
+  scanner = new Html5Qrcode(READER_ID, { formatsToSupport, verbose: false });
+
+  try {
+    await scanner.start(
+      { facingMode: 'environment' },
+      // A wide, short box matches a 1D barcode's shape better than a square
+      // one — easier to line up the card without hunting for the frame.
+      { fps: 15, qrbox: { width: 280, height: 110 } },
+      (decodedText) => onDecoded(decodedText),
+      () => {} // per-frame "nothing found" — expected constantly, ignore
+    );
+    scanning = true;
+    els.startBtn.style.display = 'none';
+    els.stopBtn.style.display = 'block';
+    setStatus('Scanning — hold each ID card steady in the box.', 'info');
+    acquireWakeLock();
+    updateTorchButton();
+    setupZoom();
+  } catch (err) {
+    els.startBtn.disabled = false;
+    setStatus('Could not access camera: ' + (err && err.message ? err.message : err), 'err');
+  }
+}
+
+async function stopScanning() {
+  if (!scanner || !scanning) return;
+  try {
+    await scanner.stop();
+    scanner.clear();
+  } catch { /* already stopped/cleared — fine */ }
+  scanning = false;
+  els.startBtn.style.display = 'block';
+  els.startBtn.disabled = false;
+  els.stopBtn.style.display = 'none';
+  els.torchBtn.style.display = 'none';
+  hideZoom();
+  releaseWakeLock();
+  clearStatus();
+}
+
+function addManualEntry() {
+  const rollNo = els.manualInput.value.trim();
+  if (!rollNo) return;
+  if (!ROLL_NO_RE.test(rollNo)) {
+    setStatus('Roll number must be 24 followed by 7 digits (e.g. 240701424).', 'err');
+    return;
+  }
+  onDecoded(rollNo); // same dedupe/persistence/beep path as a real scan
+  els.manualInput.value = '';
+  els.manualInput.focus();
+}
+
+// The real college ID has a fixed "2116" prefix in front of the app's 9-digit
+// format (e.g. 240701424 on-screen is actually 2116240701424 on the card) —
+// only the Excel export shows the full ID; live scan/list stays on the bare
+// 9 digits, same split as Project 1's export.
+const COLLEGE_ID_PREFIX = '2116';
+function fullRollNo(rollNo) {
+  return /^\d{9}$/.test(rollNo) ? COLLEGE_ID_PREFIX + rollNo : rollNo;
+}
+
+// Guessed from a real example (ravisankar.mr.2024.cse@rajalakshmi.edu.in for
+// "Ravi Sankar M R", roll 240701424): firstname+middlename run together,
+// trailing 1-2 letter initial words joined separately, then .year.dept.
+// Pattern, verified against the college directory by the owner (Gmail
+// autocomplete, 2026-10-08) for names ending in initials in every department
+// and for names starting with initials: name words run together + "." +
+// initials (1-2 letter words, wherever they sit in the name) + ".year.dept".
+//   "Ravi Sankar M R" -> ravisankar.mr.2024.cse   "V Aakash Velan" -> aakashvelan.v.2024.aiml
+// Department part: the owner's short codes, picked from digits 3-4 of the roll
+// number (2407.. = CSE, 2415.. = AI&ML, ...; that mapping is exact in the real
+// DigiCampus data). A roll with an unknown department code gets a blank email
+// rather than a wrong one. Still a guess for names that don't fit (e.g. a real
+// short surname like "Subedi" is fine, but a 1-2 letter given name would be
+// treated as an initial) until a real roll->email list replaces it.
+const DEPT_CODES = { '03': 'bme', '07': 'cse', '11': 'mech', '12': 'mct', '14': 'csbs', '15': 'aiml', '18': 'aids' };
+function guessEmail(name, rollNo) {
+  const dept = DEPT_CODES[String(rollNo).slice(2, 4)];
+  if (!name || !dept) return '';
+  // any non-letter (space, dot, stray punctuation) is a word break: "S.G Jenell" -> S, G, Jenell
+  const words = name.split(/[^A-Za-z]+/).filter(Boolean);
+  if (!words.length) return '';
+  const isInitial = (w) => /^[A-Za-z]{1,2}$/.test(w);
+  let lead = 0;
+  while (lead < words.length && isInitial(words[lead])) lead++;
+  let first, initials;
+  if (lead === words.length) { // nothing but short words: don't split into nothing
+    first = words.join('');
+    initials = '';
+  } else {
+    let trail = 0;
+    while (trail < words.length - lead && isInitial(words[words.length - 1 - trail])) trail++;
+    // middle: a run of 2+ initials is its own dotted segment ("Immanuel S A Spurgeon" ->
+    // immanuel.sa.spurgeon); a single short middle letter merges into the name (verified in directory)
+    const mid = words.slice(lead, words.length - trail);
+    const segs = [''];
+    for (let i = 0; i < mid.length;) {
+      let j = i; while (j < mid.length && isInitial(mid[j])) j++;
+      if (j - i >= 2) { segs.push(mid.slice(i, j).join(''), ''); i = j; }
+      else { segs[segs.length - 1] += mid[i]; i++; }
+    }
+    first = segs.filter(Boolean).join('.');
+    initials = [...words.slice(0, lead), ...words.slice(words.length - trail)].join('');
+  }
+  first = first.toLowerCase();
+  initials = initials.toLowerCase();
+  const year = '20' + rollNo.slice(0, 2);
+  const local = initials ? `${first}.${initials}.${year}.${dept}` : `${first}.${year}.${dept}`;
+  return `${local}@rajalakshmi.edu.in`;
+}
+
+// Single-sheet format matching the college DB export: Email id, Register id,
+// Attendance. Email is a best-effort guess from the roster name (see
+// guessEmail above), blank if no roster/name is loaded. Every roster entry
+// defaults to "Absent"; a scan flips just that row to "Present".
+function exportToExcel() {
+  const source = roster.size > 0
+    ? [...roster.keys()]
+    : rows.map((r) => r.rollNo); // no roster loaded: list only what was actually scanned
+  const data = [
+    ['Email id', 'Register id', 'Attendance'],
+    ...source.map((rollNo) => [
+      guessEmail(roster.get(rollNo), rollNo),
+      fullRollNo(rollNo),
+      seenRollNos.has(rollNo) ? 'PRESENT' : 'ABSENT',
+    ]),
+  ];
+  const ws = XLSX.utils.aoa_to_sheet(data);
+  ws['!cols'] = [{ wch: 42 }, { wch: 18 }, { wch: 12 }]; // 42 fits e.g. ravisankar.mr.2024.cse@rajalakshmi.edu.in unclipped
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Attendance');
+
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  // class name in the file name when a class is selected (e.g. CSE_2024_Group_1_2026-10-09T10-30-00), so exports are easy to tell apart
+  const defaultName = `${trialActive ? activeClassLabel.replace(/[^A-Za-z0-9_-]+/g, '_') : 'RollCall'}_${stamp}`;
+  // Optional rename before download — e.g. "Physics_240923" instead of a
+  // bare timestamp. Sanitised so a stray / or \ in what they typed can't
+  // turn into a nested path in the downloaded filename.
+  const typed = els.exportFilename.value.trim().replace(/[\\/:*?"<>|]/g, '');
+  const base = typed || defaultName;
+  XLSX.writeFile(wb, `${base.replace(/\.xlsx$/i, '')}.xlsx`);
+}
+
+async function clearList() {
+  if (rows.length === 0 && dupeCount === 0) return;
+  const msg = rows.length > 0
+    ? `Clear all ${rows.length} scanned entries and the repeats count? This cannot be undone (export first if you need them).`
+    : `Clear the repeats count (${dupeCount})? There's no scanned list to lose.`;
+  if (!(await askConfirm(msg))) return;
+  rows.length = 0;
+  seenRollNos.clear();
+  dupeCount = 0;
+  dupeLog.length = 0;
+  lastDecoded = { text: null, at: 0 };
+  saveState();
+  renderList();
+}
+
+els.startBtn.addEventListener('click', startScanning);
+els.stopBtn.addEventListener('click', stopScanning);
+els.torchBtn.addEventListener('click', toggleTorch);
+els.exportBtn.addEventListener('click', exportToExcel);
+els.clearBtn.addEventListener('click', clearList);
+
+els.manualToggle.addEventListener('click', (e) => {
+  e.preventDefault();
+  const isHidden = els.manualEntry.style.display === 'none';
+  els.manualEntry.style.display = isHidden ? 'flex' : 'none';
+  e.target.textContent = isHidden ? 'Hide manual entry' : "Can't scan a barcode? Enter it manually";
+  if (isHidden) els.manualInput.focus();
+});
+els.manualAddBtn.addEventListener('click', addManualEntry);
+els.manualInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') addManualEntry(); });
+
+els.dupeToggle.addEventListener('click', (e) => {
+  e.preventDefault();
+  const isHidden = els.dupeList.style.display === 'none';
+  els.dupeList.style.display = isHidden ? 'block' : 'none';
+  e.target.textContent = isHidden ? 'Hide repeats' : 'View repeats';
+});
+
+function setRosterStatus(text, kind) {
+  els.rosterStatus.textContent = text;
+  els.rosterStatus.className = `status show ${kind}`;
+}
+
+els.rosterClearBtn.addEventListener('click', async () => {
+  const blockNote = trialActive ? ' (roll-number restriction lifted too — any roll can be scanned again)' : '';
+  if (!(await askConfirm(`Clear the loaded roster (${roster.size} students)? Already-scanned entries stay, but names/absent-tracking go away${blockNote}.`))) return;
+  roster.clear();
+  trialActive = false;
+  saveRoster();
+  saveTrialActive();
+  els.rosterClearBtn.style.display = 'none';
+  setRosterStatus('Roster cleared.', 'info');
+  renderList();
+});
+
+// Hidden by default — most classes don't have a roster yet (college DB isn't
+// wired in), so showing an empty paste-box up front would just be clutter.
+// Only opt in if there's actually a reason to.
+els.rosterToggle.addEventListener('click', (e) => {
+  e.preventDefault();
+  const isHidden = els.rosterSection.style.display === 'none';
+  els.rosterSection.style.display = isHidden ? 'block' : 'none';
+  e.target.textContent = isHidden ? 'Hide class roster' : "Have a class roster? Tap to add names + absent tracking";
+});
+
+// --- Locked scan mode -------------------------------------------------------
+// Staff phone gets passed to students: while locked, CSS hides everything but
+// the camera + scan notifications, and only a staff PIN unlocks. This cannot
+// stop someone leaving the page (a web page can't) — Android app pinning /
+// iOS Guided Access does that; this just makes every in-page control unreachable.
+// PIN is a hash in localStorage: keeps out students poking buttons, not
+// someone with dev tools / cleared site data (clearing site data also resets it).
+const LOCK_KEY = 'rollcall_locked_v1';
+const PIN_KEY = 'rollcall_pin_v1';
+const PIN_RE = /^\d{4,6}$/;
+const lockEls = {
+  btn: document.getElementById('lock-btn'),
+  panel: document.getElementById('pin-panel'),
+  label: document.getElementById('pin-label'),
+  input: document.getElementById('pin-input'),
+  ok: document.getElementById('pin-ok'),
+  cancel: document.getElementById('pin-cancel'),
+  status: document.getElementById('pin-status'),
+  resetBtn: document.getElementById('reset-pin-btn'),
+};
+let pinMode = null; // 'set' | 'unlock'
+// Wrong-PIN count and lockout end are kept in localStorage, not just memory: otherwise a
+// page reload reset them and the 30-second lockout could be skipped for free.
+const PIN_GUARD_KEY = 'rollcall_pin_guard_v1';
+let pinFails = 0;
+let pinBlockedUntil = 0;
+try {
+  const g = JSON.parse(localStorage.getItem(PIN_GUARD_KEY));
+  if (g) { pinFails = Number(g.fails) || 0; pinBlockedUntil = Number(g.blockedUntil) || 0; }
+} catch { /* start clean */ }
+function savePinGuard() {
+  try {
+    if (pinFails || pinBlockedUntil) localStorage.setItem(PIN_GUARD_KEY, JSON.stringify({ fails: pinFails, blockedUntil: pinBlockedUntil }));
+    else localStorage.removeItem(PIN_GUARD_KEY);
+  } catch { /* not critical */ }
+}
+
+async function hashPin(pin) {
+  if (!(window.crypto && crypto.subtle)) return 'p:' + pin; // insecure context: plain fallback
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('rollcall:' + pin));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+function isLocked() { return document.body.classList.contains('locked'); }
+function applyLock(on) {
+  document.body.classList.toggle('locked', on);
+  try { localStorage.setItem(LOCK_KEY, on ? '1' : ''); } catch { /* not critical */ }
+  lockEls.btn.textContent = on ? '🔓 Unlock (staff PIN)' : '🔒 Lock for students';
+  updateResetBtn();
+  closePinPanel();
+}
+// Only ever reachable while unlocked (hidden by .lockable during lock) — a
+// forgotten PIN otherwise has no in-page recovery short of clearing site data.
+function updateResetBtn() {
+  let hasPin = false;
+  try { hasPin = !!localStorage.getItem(PIN_KEY); } catch { /* treat as no PIN */ }
+  lockEls.resetBtn.style.display = hasPin && !isLocked() ? 'block' : 'none';
+}
+lockEls.resetBtn.addEventListener('click', async () => {
+  if (!(await askConfirm('Reset the staff PIN? You\'ll set a new one next time you lock.'))) return;
+  try { localStorage.removeItem(PIN_KEY); } catch { /* not critical */ }
+  updateResetBtn();
+  setStatus('PIN reset — a new one will be asked for next lock.', 'info');
+});
+function openPinPanel(mode) {
+  pinMode = mode;
+  lockEls.label.textContent = mode === 'set' ? 'Set a staff PIN (4–6 digits)' : 'Staff PIN';
+  lockEls.status.className = 'status';
+  lockEls.input.value = '';
+  lockEls.panel.style.display = 'block';
+  lockEls.btn.style.display = 'none';
+  lockEls.input.focus();
+}
+function closePinPanel() {
+  pinMode = null;
+  lockEls.panel.style.display = 'none';
+  lockEls.btn.style.display = 'block';
+}
+function pinError(text) {
+  lockEls.status.textContent = text;
+  lockEls.status.className = 'status show err';
+  lockEls.input.value = '';
+}
+async function submitPin() {
+  const pin = lockEls.input.value.trim();
+  if (!PIN_RE.test(pin)) { pinError('PIN must be 4–6 digits.'); return; }
+  if (pinMode === 'set') {
+    try { localStorage.setItem(PIN_KEY, await hashPin(pin)); } catch { pinError('Could not save PIN.'); return; }
+    applyLock(true);
+    return;
+  }
+  if (Date.now() < pinBlockedUntil) { pinError(`Too many wrong tries — wait ${Math.ceil((pinBlockedUntil - Date.now()) / 1000)} seconds.`); return; }
+  let stored = null;
+  try { stored = localStorage.getItem(PIN_KEY); } catch { /* treated as no PIN below */ }
+  if (!stored || (await hashPin(pin)) === stored) {
+    pinFails = 0;
+    pinBlockedUntil = 0;
+    savePinGuard();
+    applyLock(false);
+    return;
+  }
+  if (++pinFails >= 5) { pinFails = 0; pinBlockedUntil = Date.now() + 30000; savePinGuard(); pinError('Too many wrong tries — wait 30 seconds.'); return; }
+  savePinGuard();
+  pinError('Wrong PIN.');
+}
+lockEls.btn.addEventListener('click', () => {
+  if (isLocked()) { openPinPanel('unlock'); return; }
+  let hasPin = false;
+  try { hasPin = !!localStorage.getItem(PIN_KEY); } catch { /* no storage: ask to set, will fail visibly */ }
+  if (hasPin) applyLock(true); else openPinPanel('set');
+});
+lockEls.ok.addEventListener('click', submitPin);
+lockEls.cancel.addEventListener('click', closePinPanel);
+lockEls.input.addEventListener('keydown', (e) => { if (e.key === 'Enter') submitPin(); });
+try { if (localStorage.getItem(LOCK_KEY) === '1') applyLock(true); } catch { /* start unlocked */ }
+updateResetBtn();
+
+loadRoster();
+loadTrialActive();
+if (roster.size === 0) trialActive = false; // a lost roster must not leave every scan blocked
+if (roster.size > 0) {
+  els.rosterClearBtn.style.display = 'block';
+  setRosterStatus(`${roster.size} students loaded from before.${trialActive ? ' Only these roll numbers can be scanned.' : ''}`, 'info');
+  // A roster was already loaded on a previous visit — open the section so
+  // "Clear roster" and the count are actually visible, not hidden behind
+  // the toggle with no visible sign a roster exists.
+  els.rosterSection.style.display = 'block';
+  els.rosterToggle.textContent = 'Hide class roster';
+}
+
+loadState();
+renderList();
+if (rows.length > 0) setStatus(`Restored ${rows.length} scan${rows.length === 1 ? '' : 's'} from before — keep going or export.`, 'info');
+
+// --- Staff classes (Firestore -> cached on the phone) -------------------------
+// Each staff member sees only their own classes. Tapping one loads that class's
+// roster (only those roll numbers can be scanned) and starts the camera. The
+// list is fetched once at sign-in and cached; every session after is offline.
+// The cache is kept permanently (until the same account re-syncs) so staff can work
+// offline forever after one sign-in. It holds real student names, so it is
+// discarded if a different account signs in, and the phone's PIN lock covers
+// the passed-around case.
+const classEls = {
+  card: document.getElementById('classes-card'),
+  list: document.getElementById('class-list'),
+  status: document.getElementById('class-status'),
+};
+
+function cachedClassesFor(email) {
+  try {
+    const c = JSON.parse(localStorage.getItem(CLASSES_KEY));
+    return c && c.email === email && Array.isArray(c.classes) ? c.classes : [];
+  } catch { return []; }
+}
+// A trial class carries its own end date; once that passes it is removed from the phone, and
+// the roster is cleared too if that class was the one in use.
+function dropExpiredTrial(email) {
+  const all = cachedClassesFor(email);
+  const expired = all.filter((c) => c.trialUntil && pastDate(c.trialUntil));
+  if (!expired.length) return;
+  saveClasses(email, all.filter((c) => !expired.includes(c)));
+  if (trialActive && expired.some((c) => c.name === activeClassLabel)) {
+    roster.clear(); trialActive = false;
+    saveRoster(); saveTrialActive(); renderList();
+  }
+}
+function saveClasses(email, classes) {
+  try { localStorage.setItem(CLASSES_KEY, JSON.stringify({ email, classes, syncedAt: new Date().toISOString() })); } catch { /* not critical */ }
+}
+// Student names + the active roster all go; the scanned roll numbers stay (export first).
+function wipeClassData() {
+  try { localStorage.removeItem(CLASSES_KEY); } catch { /* not critical */ }
+  myClasses = [];
+  roster.clear();
+  trialActive = false;
+  activeClassLabel = 'Trial Class 1';
+  saveRoster();
+  saveTrialActive();
+}
+
+const prettyClass = (name) => name.replace(/_/g, ' ');
+
+// Classes whose student names are expanded ("View students"); kept across re-renders.
+const expandedClasses = new Set();
+
+function renderClassList() {
+  // always shown once signed in: with no saved classes the Re-sync link must stay reachable
+  classEls.card.style.display = 'block';
+  if (!myClasses.length) classEls.list.innerHTML = '<p class="footer-note" style="margin:0;">No classes saved on this phone yet. Tap Re-sync below (needs internet).</p>';
+  else
+    classEls.list.innerHTML = myClasses.map((c, i) => {
+    const open = expandedClasses.has(c.name);
+    return `
+    <button class="secondary class-btn${trialActive && activeClassLabel === c.name ? ' active' : ''}" data-i="${i}">
+      <span>${escapeHtml(prettyClass(c.name))}</span>
+      <small>${escapeHtml(c.component)} · ${c.students.length} students</small>
+    </button>
+    <a href="#" class="view-students" data-i="${i}">${open ? 'Hide students' : 'View students'}</a>
+    ${open ? `<ul class="list student-preview">${c.students.map((st) => `<li><span><span class="roll">${escapeHtml(st.roll)}</span> — ${escapeHtml(st.name)}</span></li>`).join('')}</ul>` : ''}`;
+  }).join('');
+}
+
+function setClassStatus(text, kind) {
+  classEls.status.textContent = text;
+  classEls.status.className = `status show ${kind}`;
+}
+
+async function selectClass(cls) {
+  const switching = trialActive && activeClassLabel !== cls.name;
+  if (switching && rows.length > 0) {
+    if (!(await askConfirm(`Switch to ${prettyClass(cls.name)}? ${rows.length === 1 ? 'The 1 scan so far belongs' : `The ${rows.length} scans so far belong`} to ${prettyClass(activeClassLabel)} and will be cleared — export first if you need them.`))) return;
+    rows.length = 0;
+    seenRollNos.clear();
+    dupeCount = 0;
+    dupeLog.length = 0;
+    lastDecoded = { text: null, at: 0 };
+    saveState();
+  }
+  roster.clear();
+  for (const st of cls.students) roster.set(st.roll, st.name);
+  trialActive = true;
+  activeClassLabel = cls.name;
+  saveRoster();
+  saveTrialActive();
+  els.rosterClearBtn.style.display = 'block';
+  setRosterStatus(`${prettyClass(cls.name)} — ${roster.size} students. Only these roll numbers can be scanned.`, 'ok');
+  renderList();
+  renderClassList();
+  setClassStatus(`${prettyClass(cls.name)} selected.`, 'ok');
+  if (!scanning) startScanning();
+}
+classEls.list.addEventListener('click', (e) => {
+  const link = e.target.closest('a.view-students');
+  if (link) {
+    e.preventDefault();
+    const name = myClasses[Number(link.dataset.i)].name;
+    expandedClasses.has(name) ? expandedClasses.delete(name) : expandedClasses.add(name);
+    renderClassList();
+    return;
+  }
+  const btn = e.target.closest('button.class-btn');
+  if (btn) selectClass(myClasses[Number(btn.dataset.i)]);
+});
+
+// Needs internet and the Google ID token from this sign-in. The Firebase SDK is
+// loaded from Google only here, so every normal session stays fully offline.
+// Firestore rules (firebase/firestore.rules) only return classes whose
+// staffEmails contains the signed-in email, so a student account gets nothing.
+async function fetchClassesFromFirestore(idToken, email) {
+  const base = `https://www.gstatic.com/firebasejs/${FIREBASE_SDK_VERSION}`;
+  const [{ initializeApp }, { getAuth, GoogleAuthProvider, signInWithCredential }, { getFirestore, collection, query, where, getDocs, doc, getDocFromServer }] =
+    await Promise.all([import(`${base}/firebase-app.js`), import(`${base}/firebase-auth.js`), import(`${base}/firebase-firestore.js`)]);
+  const app = initializeApp(FIREBASE_CONFIG);
+  await signInWithCredential(getAuth(app), GoogleAuthProvider.credential(idToken));
+  const db = getFirestore(app);
+  const snap = await getDocs(query(collection(db, 'classes'), where('staffEmails', 'array-contains', email)));
+  // On a weak/offline connection Firestore can answer from its empty local cache; that is not "no classes".
+  if (snap.metadata.fromCache) throw new Error('weak network: answer came from cache, not the server');
+  const own = snap.docs
+    .map((d) => d.data())
+    .sort((a, b) => (a.component === b.component ? a.name.localeCompare(b.name, undefined, { numeric: true }) : a.component === 'Lecture' ? -1 : 1));
+  return withTrialClass(own, () => getDocFromServer(doc(db, 'classes', TRIAL_CLASS_ID)).then((d) => (d.exists() ? d.data() : null)));
+}
+
+// Only for an account with nothing of its own. A refusal (a student account, or the rule has
+// expired) just leaves the list empty; a network error is passed on so the retry logic runs.
+async function withTrialClass(own, fetchTrial) {
+  if (own.length || pastDate(TRIAL_UNTIL)) return own;
+  try {
+    const cls = await fetchTrial();
+    if (!cls) return own;
+    const out = [Object.assign({}, cls, { trialUntil: TRIAL_UNTIL })];
+    out.trial = true;
+    return out;
+  } catch (err) {
+    if (err && err.code === 'permission-denied') return own;
+    throw err;
+  }
+}
+
+let lastGoogleToken = null; // kept in memory only, so "Retry" can re-use this sign-in without signing out
+const withTimeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout: network too slow')), ms))]);
+
+async function syncClasses(idToken, email) {
+  if (!FIREBASE_CONFIG) return;
+  lastGoogleToken = { idToken, email };
+  setClassStatus('Loading your classes…', 'info');
+  classEls.card.style.display = 'block';
+  let lastErr;
+  // weak network: up to 3 tries, 30s each; saved classes are never replaced unless a try succeeds
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const classes = await withTimeout(fetchClassesFromFirestore(idToken, email), 30000);
+      // an empty answer must not wipe classes already saved on this phone
+      if (classes.length || !myClasses.length) { saveClasses(email, classes); myClasses = classes; }
+      renderClassList();
+      setClassStatus(
+        classes.trial ? 'No classes are assigned to this account yet, so a trial class is shown.'
+          : classes.length ? '' : 'No classes are assigned to this account.',
+        classes.length ? 'info' : 'err');
+      return;
+    } catch (err) {
+      lastErr = err;
+      console.warn('class sync failed (attempt ' + attempt + ')', err);
+      if (attempt < 3) { setClassStatus(`Slow network — retrying (${attempt}/3)…`, 'info'); await new Promise((r) => setTimeout(r, 2000)); }
+    }
+  }
+  setClassStatus(`Could not load your classes (${lastErr && (lastErr.code || lastErr.message) || 'unknown error'}). ${myClasses.length ? 'Showing the classes saved on this phone. ' : ''}Move to better signal and tap Retry.`, 'err');
+  const retry = document.createElement('a');
+  retry.href = '#'; retry.textContent = ' Retry'; retry.style.marginLeft = '6px';
+  retry.addEventListener('click', (e) => { e.preventDefault(); syncClasses(lastGoogleToken.idToken, lastGoogleToken.email); });
+  classEls.status.appendChild(retry);
+}
+
+// --- Staff sign-in gate ---------------------------------------------------
+
+const loginEls = {
+  screen: document.getElementById('login-screen'),
+  btnSlot: document.getElementById('google-btn-slot'),
+  status: document.getElementById('login-status'),
+  signedInAs: document.getElementById('signed-in-as'),
+};
+
+function loginError(text) {
+  loginEls.status.textContent = text;
+  loginEls.status.className = 'status show err';
+}
+
+function getCachedUser() {
+  try {
+    const raw = localStorage.getItem(LOGIN_KEY);
+    if (!raw) return null;
+    const u = JSON.parse(raw);
+    // a student-style session saved before this rule existed must not stay signed in
+    return u && typeof u.email === 'string' && accountAllowed(u.email.toLowerCase()) ? u : null;
+  } catch { return null; }
+}
+
+// No signature check (see constant comment above) — just reads the JSON
+// payload out of the JWT's middle segment.
+function decodeJwt(token) {
+  const payload = token.split('.')[1];
+  const json = atob(payload.replace(/-/g, '+').replace(/_/g, '/'));
+  return JSON.parse(json);
+}
+
+// The scanned list belongs to the account that scanned it. Switching accounts on a shared
+// phone used to keep it, so the next staff member exported someone else's class as PRESENT.
+// A list with no recorded owner (made before this existed) is adopted by whoever is signed in.
+const SCAN_OWNER_KEY = 'rollcall_scan_owner_v1';
+function claimScansFor(email) {
+  let owner = null;
+  try { owner = localStorage.getItem(SCAN_OWNER_KEY); } catch { /* treated as unowned */ }
+  if (owner && owner !== email && (rows.length || dupeCount)) {
+    rows.length = 0;
+    seenRollNos.clear();
+    dupeCount = 0;
+    dupeLog.length = 0;
+    lastDecoded = { text: null, at: 0 };
+    saveState();
+    renderList();
+    setStatus('Scans left on this phone by another account were cleared.', 'info');
+  }
+  try { localStorage.setItem(SCAN_OWNER_KEY, email); } catch { /* not critical */ }
+}
+
+function showApp(user) {
+  claimScansFor(user.email);
+  loginEls.screen.style.display = 'none';
+  document.body.classList.remove('login-pending');
+  loginEls.signedInAs.style.display = 'block';
+  loginEls.signedInAs.innerHTML = `Signed in as ${escapeHtml(user.email)} · <a href="#" id="sign-out-link">Sign out</a>`;
+  document.getElementById('sign-out-link').addEventListener('click', async (e) => {
+    e.preventDefault();
+    if (await askConfirm('Sign out? Your classes stay saved on this phone, but you need internet to sign in again.')) signOut();
+  });
+  dropExpiredTrial(user.email);
+  myClasses = cachedClassesFor(user.email);
+  renderClassList();
+  // Ask the browser not to evict the saved classes when the phone runs low on
+  // space (installed apps are usually granted this automatically).
+  if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+}
+
+// Signing out only ends the login. The saved classes stay on the phone for
+// offline use; they are replaced when the same account re-syncs, and wiped if a
+// different account signs in (see handleCredentialResponse).
+function signOut() {
+  try { localStorage.removeItem(LOGIN_KEY); } catch { /* not critical */ }
+  location.reload();
+}
+document.getElementById('resync-link').addEventListener('click', async (e) => {
+  e.preventDefault();
+  if (await askConfirm('Re-sync signs you out and back in to download your classes again. You need internet to sign back in; your saved classes stay on this phone until the new ones arrive. Continue?')) signOut();
+});
+
+function showLoginScreen() {
+  loginEls.screen.style.display = 'flex';
+  document.body.classList.add('login-pending');
+}
+
+function handleCredentialResponse(response) {
+  let claims;
+  try { claims = decodeJwt(response.credential); } catch { loginError('Could not read that sign-in response — try again.'); return; }
+  const email = String(claims.email || '').toLowerCase();
+  const domainOk = claims.hd === ALLOWED_EMAIL_DOMAIN || email.endsWith('@' + ALLOWED_EMAIL_DOMAIN);
+  if (!domainOk) { loginError(`${claims.email || 'That account'} isn't a @${ALLOWED_EMAIL_DOMAIN} account.`); return; }
+  if (!accountAllowed(email)) { loginError(`${claims.email} looks like a student account. This app is for staff sign-in only.`); return; }
+  const user = { email, name: claims.name || email, loginAt: new Date().toISOString() };
+  let cachedFor = null;
+  try { cachedFor = (JSON.parse(localStorage.getItem(CLASSES_KEY)) || {}).email; } catch { /* none */ }
+  if (cachedFor && cachedFor !== email) wipeClassData();
+  try { localStorage.setItem(LOGIN_KEY, JSON.stringify(user)); } catch { /* still proceed for this session */ }
+  showApp(user);
+  syncClasses(response.credential, email);
+}
+window.handleCredentialResponse = handleCredentialResponse; // GIS calls this by name from its own script
+
+function initGoogleSignIn() {
+  if (!window.google || !google.accounts || !google.accounts.id) {
+    loginError('Could not reach Google sign-in — check your internet connection and reload.');
+    return;
+  }
+  if (GOOGLE_CLIENT_ID.startsWith('REPLACE_WITH')) {
+    loginError('Sign-in isn’t configured yet (no Google Client ID set) — contact the app maintainer.');
+    return;
+  }
+  google.accounts.id.initialize({
+    client_id: GOOGLE_CLIENT_ID,
+    callback: handleCredentialResponse,
+    hd: ALLOWED_EMAIL_DOMAIN, // hints Google's picker toward college accounts; still re-checked above
+  });
+  google.accounts.id.renderButton(loginEls.btnSlot, { theme: 'outline', size: 'large', width: 280 });
+}
+
+// GIS is loaded from Google, not vendored — the one deliberate exception to
+// this app's offline-first rule, same tradeoff the Firebase plan already
+// accepted ("first-time login needs internet once"). Only fetched when
+// there's no cached session; every login after the first is fully offline.
+function loadGoogleSignIn() {
+  const script = document.createElement('script');
+  script.src = 'https://accounts.google.com/gsi/client';
+  script.async = true;
+  script.defer = true;
+  script.onload = initGoogleSignIn;
+  script.onerror = () => loginError('Could not reach Google sign-in — check your internet connection and reload.');
+  document.head.appendChild(script);
+}
+
+const cachedUser = getCachedUser();
+if (cachedUser) {
+  showApp(cachedUser);
+} else {
+  showLoginScreen();
+  loadGoogleSignIn();
+}
+
+// Everything above is synchronous, so the page is actually ready right now —
+// but hiding the splash instantly on a fast/cached load would just flash it.
+// Wait out whatever's left of SPLASH_MIN_MS instead.
+const splashEl = document.getElementById('splash');
+const elapsed = performance.now() - SPLASH_START;
+setTimeout(() => splashEl.classList.add('hide'), Math.max(0, SPLASH_MIN_MS - elapsed));
+
+if ('serviceWorker' in navigator) {
+  // Captured before registering: distinguishes "first-ever install" (no
+  // prior controller, controllerchange fires once with nothing meaningful
+  // to reload) from a genuine update on a return visit.
+  const hadController = !!navigator.serviceWorker.controller;
+
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('sw.js').catch(() => {
+      // Offline-first still works without SW registration succeeding —
+      // this only affects installability/first-load caching, not scanning.
+    });
+  });
+
+  // sw.js already calls skipWaiting()+clients.claim(), so a new version
+  // takes over silently in the background — but the tab's already-running
+  // JS doesn't change until an actual reload. Best practice (confirmed via
+  // search) is to notify, not force-reload: a mid-scan auto-refresh would
+  // drop whatever the teacher was doing. Fires once per real update, not on
+  // the very first install (no pre-existing controller to change from yet).
+  let notified = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (notified || !hadController) return;
+    notified = true;
+    setStatus('Updated — reload the page to get the latest version.', 'info');
+  });
+}

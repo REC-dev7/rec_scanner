@@ -1,0 +1,35 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // One document per class. A signed-in staff member can read a class only
+    // if their (verified) email is in that class's staffEmails list, so each
+    // staff member gets their own classes and nothing else. Students have no
+    // entry in any staffEmails, so they get nothing.
+    // The app must query with where('staffEmails', 'array-contains', email);
+    // a broader query is rejected. Emails are stored lowercase.
+    match /classes/{classId} {
+      allow read: if request.auth != null
+                  && request.auth.token.email_verified == true
+                  && request.auth.token.email.lower() in resource.data.staffEmails;
+      allow write: if false; // loaded only by firebase/import-classes.js (Admin SDK bypasses rules)
+
+      // TEMPORARY trial access for the staff demo, while real class data for those
+      // staff is not loaded yet. Any verified college account that does NOT look like a
+      // student account (student emails contain a ".20YY." batch segment, e.g.
+      // name.initials.2024.cse@) may open this ONE class by its id (get only, so no
+      // listing), and only until the date below. To switch it off early, delete this
+      // block and publish the rules. Keep the date in sync with TRIAL_UNTIL in app.js.
+      allow get: if classId == 'CB23F35__CSE_2024_Group_1'
+                 && request.auth != null
+                 && request.auth.token.email_verified == true
+                 && request.auth.token.email.lower().matches('.*@rajalakshmi[.]edu[.]in')
+                 && !request.auth.token.email.lower().matches('.*[.]20[0-9][0-9][.].*')
+                 && request.time < timestamp.date(2026, 10, 16);
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

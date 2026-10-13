@@ -1,0 +1,305 @@
+:root {
+  /* REC brand palette (matched from rec-db-official.web.app, rectransport.com,
+     rajalakshmi.org) — light lavender surface, purple accent + gradient. */
+  --bg: #eeeef2;
+  --surface: #ffffff;
+  --surface-2: #f4effb;
+  --text: #1a1a2e;
+  --text-dim: #6b6b80;
+  --accent: #6a1b9a;
+  --accent-2: #9c27b0;
+  --accent-grad: linear-gradient(135deg, #6a1b9a, #9c27b0);
+  --ok: #16a34a;
+  --err: #dc2626;
+  --warn: #d97706;
+  --border: #e0d9ec;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  /* No web font fetch — offline-first PWA can't depend on a CDN. Falls back
+     silently to system sans-serif if Poppins/Montserrat aren't installed. */
+  font-family: Poppins, Montserrat, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  line-height: 1.4;
+  max-width: 640px;
+  margin: 0 auto;
+  /* env(safe-area-inset-*) keeps content clear of the iPhone notch/home
+     indicator when installed as a standalone PWA (viewport-fit=cover in
+     index.html opts into drawing under them in the first place). The
+     16px/48px are the same base padding as before, just added to the inset. */
+  padding: max(16px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(48px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+}
+
+h1 {
+  font-size: 1.5rem;
+  font-weight: 700;
+  margin: 10px 0 4px;
+  letter-spacing: -0.01em;
+  color: var(--accent); /* fallback if background-clip:text isn't supported — without this the heading renders invisible */
+}
+@supports (background-clip: text) or (-webkit-background-clip: text) {
+  h1 {
+    background: var(--accent-grad);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+}
+
+h2 {
+  font-size: 1rem;
+  margin: 0;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+label {
+  display: block;
+  font-size: 0.78rem;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin: 0 0 6px;
+}
+
+.subtitle {
+  color: var(--text-dim);
+  font-size: 0.85rem;
+  margin: 0 0 18px;
+}
+
+/* Small uppercase section label above a card's content — breaks up a page
+   of otherwise-identical cards so each card reads as its own step. */
+.eyebrow {
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: var(--accent);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin: 0 0 12px;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 18px;
+  margin-bottom: 18px;
+  box-shadow: 0 2px 10px rgba(106, 27, 154, 0.08);
+}
+
+.field {
+  width: 100%;
+  padding: 11px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 0.95rem;
+  font-family: inherit;
+}
+.field:focus { outline: none; border-color: var(--accent); }
+textarea.field { resize: vertical; }
+
+.btn-auto { width: auto; margin-top: 0; }
+.btn-sm { padding: 8px 14px; font-size: 0.85rem; }
+
+#reader {
+  width: 100%;
+  border-radius: 10px;
+  overflow: hidden;
+  touch-action: pan-y; /* one finger still scrolls the page; two fingers are left to the pinch-zoom handler */
+}
+.zoom-row { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
+.zoom-row label { margin: 0; flex: none; }
+.zoom-row input[type="range"] { flex: 1; min-width: 0; accent-color: var(--accent); height: 28px; }
+
+button {
+  font-size: 0.95rem;
+  font-weight: 600;
+  padding: 12px 18px;
+  border-radius: 999px; /* pill buttons, matches REC site CTAs */
+  border: none;
+  cursor: pointer;
+  width: 100%;
+  margin-top: 8px;
+}
+
+button.primary { background: var(--accent-grad); color: white; }
+button.secondary { background: var(--surface-2); color: var(--accent); border: 1px solid var(--border); }
+button.danger { background: var(--err); color: white; }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.stat-row {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 4px;
+}
+
+.stat {
+  flex: 1;
+  background: var(--accent-grad);
+  border-radius: 12px;
+  padding: 10px 12px;
+  text-align: center;
+}
+
+.stat .num { font-size: 1.6rem; font-weight: 700; color: white; }
+.stat .label { font-size: 0.72rem; color: rgba(255,255,255,.85); text-transform: uppercase; letter-spacing: .04em; }
+
+.status {
+  font-size: 0.85rem;
+  padding: 8px 10px;
+  border-radius: 8px;
+  margin-top: 10px;
+  display: none;
+}
+.status.show { display: block; }
+.status.ok { background: rgba(22,163,74,.12); color: #166534; } /* #166534 clears 6.2:1 on this tint, #15803d only cleared 4.4:1 */
+.status.err { background: rgba(220,38,38,.1); color: #b91c1c; }
+.status.info { background: rgba(106,27,154,.1); color: #6a1b9a; }
+
+.list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 360px;
+  overflow-y: auto;
+}
+
+.list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 12px 4px;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.92rem;
+}
+.list li:last-child { border-bottom: none; }
+.list li .roll { font-weight: 600; }
+.list li .time { color: var(--text-dim); font-size: 0.78rem; margin-top: 1px; }
+.list li .actions { display: flex; align-items: center; gap: 2px; flex-shrink: 0; }
+.list li .remove {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-size: 1.1rem;
+  width: 44px;
+  height: 44px;
+  min-width: 44px; /* Apple/Android's own minimum tap-target size — was ~20px, */
+  min-height: 44px; /* too small to reliably hit one-handed mid-class */
+  padding: 0;
+  margin: 0;
+  flex-shrink: 0;
+}
+.list li .remove:hover { color: var(--err); }
+
+.empty { color: var(--text-dim); text-align: center; padding: 20px 0; font-size: 0.9rem; }
+
+.row { display: flex; gap: 8px; }
+.row button { margin-top: 0; }
+
+.footer-note {
+  text-align: center;
+  color: var(--text-dim);
+  font-size: 0.75rem;
+  margin-top: 24px;
+}
+.footer-note a { color: var(--accent); }
+
+/* Visually hidden but present for screen readers — for inputs whose label
+   would be redundant on-screen next to already-visible instruction text. */
+.sr-only {
+  position: absolute;
+  width: 1px; height: 1px;
+  padding: 0; margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Custom confirm/prompt modal — replaces native confirm()/prompt() so the
+   dialog matches the app theme instead of the browser's default popup. */
+.modal-overlay {
+  position: fixed; inset: 0;
+  background: rgba(26,26,46,.5);
+  display: flex; align-items: center; justify-content: center;
+  padding: 16px;
+  z-index: 1000;
+}
+.modal-box {
+  background: var(--surface);
+  border-radius: 16px;
+  padding: 20px;
+  max-width: 420px;
+  width: 100%;
+  box-shadow: 0 10px 30px rgba(0,0,0,.2);
+}
+.modal-box p { margin: 0 0 16px; font-size: 0.95rem; }
+.modal-box .row button { margin-top: 0; }
+
+/* Splash screen — shown for a brief minimum time on every load (both a
+   plain browser tab and the installed PWA), then faded out by app.js once
+   the page is actually ready. Covers the same gap OS-native splash screens
+   handle for an installed app, but works for a browser tab too. */
+.splash {
+  position: fixed;
+  inset: 0;
+  background: #ffffff;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  z-index: 2000;
+  transition: opacity .35s ease;
+}
+.splash-logo { width: min(280px, 80vw); height: auto; }
+.splash-app { color: var(--accent); font-size: 1.3rem; font-weight: 700; margin: 8px 0 0; text-align: center; }
+.splash.hide { opacity: 0; pointer-events: none; }
+
+/* Staff sign-in gate — same full-page overlay treatment as .splash, but
+   stays up until a valid @rajalakshmi.edu.in session exists (cached or
+   fresh), instead of a fixed timer. */
+.login-screen {
+  position: fixed;
+  inset: 0;
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 16px;
+  z-index: 1900;
+}
+.login-title { color: var(--accent); font-size: 1.3rem; font-weight: 700; margin: 8px 0 0; }
+#google-btn-slot { margin-top: 8px; min-height: 44px; }
+#signed-in-as { color: var(--text-dim); }
+#signed-in-as a { color: var(--accent); }
+
+/* While signed out, nothing but the splash/login overlays should exist in
+   the page at all — not just visually covered, since a fixed overlay alone
+   still leaves the rest tabbable/readable by assistive tech underneath. */
+body.login-pending > *:not(#login-screen):not(#splash) { display: none; }
+
+/* Locked scan mode: students see only the camera + scan notifications. */
+.lock-banner { display: none; margin: 0 0 12px; font-size: 0.95rem; font-weight: 600; color: var(--accent); }
+body.locked .lock-banner { display: block; }
+body.locked .lockable { display: none !important; }
+.pin-panel { margin-top: 10px; }
+
+/* Staff's own classes (from the roster sync): one tap loads the roster and starts scanning. */
+.class-btn { display: flex; justify-content: space-between; align-items: center; gap: 10px; text-align: left; }
+.class-btn small { color: var(--text-dim); font-weight: 500; white-space: nowrap; }
+.class-btn.active { border-color: var(--accent); background: var(--surface-2); }
+
+/* "View students": names of a class, previewed before it is selected. */
+.view-students { display: inline-block; margin: 6px 0 12px 16px; font-size: 0.82rem; color: var(--accent); }
+.student-preview { max-height: 240px; margin: 0 0 12px; border: 1px solid var(--border); border-radius: 12px; padding: 0 12px; background: var(--surface-2); }
