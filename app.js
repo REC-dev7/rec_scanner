@@ -20,7 +20,7 @@ const SPLASH_MIN_MS = 600; // avoids a flash-then-instant-hide on a fast/cached 
 // under "Authorized JavaScript origins" for that client in Google Cloud
 // Console (APIs & Services -> Credentials), so this site's origin must be
 // added there too, or sign-in fails with an origin_mismatch error.
-const GOOGLE_CLIENT_ID = '194459417743-6idjf0kcccrql1k5i3t4mhdki540lkkb.apps.googleusercontent.com';
+const GOOGLE_CLIENT_ID = '399324732813-lp4dgg2cb9d9bld3v2143c3leh0qdcqi.apps.googleusercontent.com';
 const ALLOWED_EMAIL_DOMAIN = 'rajalakshmi.edu.in';
 // Sign-in is for staff only. Student addresses look like name.initials.YYYY.dept@college and
 // staff addresses are just name@college, so anything with a ".YYYY." batch segment before the @
