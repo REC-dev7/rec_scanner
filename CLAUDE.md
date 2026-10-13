@@ -7,8 +7,9 @@ instruction: "all 3 are independent projects, don't combine." See
 research; this file covers everything since (branding, locking, export
 format, hosting, and the roster-sync plan).
 
-**Live URL:** https://ravisankarmr-design.github.io/collegeproject/
-(GitHub Pages, `gh-pages` branch of `RavisankarMR-design/collegeproject`)
+**Live URL:** https://rec-dev7.github.io/rec_scanner/
+(GitHub Pages, `main` branch / root of `REC-dev7/rec_scanner`; moved here
+2026-10-13 from the old personal-account site, which is now only a backup)
 
 ## Stack
 
@@ -190,6 +191,14 @@ existed for the paste-roster path too before removal; now it's Trial-Class-
 
 ## Hosting / URL situation (2026-09-28/29 session)
 
+**UPDATE 2026-10-13: moved.** P3 now lives at
+`https://rec-dev7.github.io/rec_scanner/` (repo `REC-dev7/rec_scanner`, Pages
+from `main`/root, v52). It signs in with `rec-scan`'s own Google OAuth client
+`399324732813-lp4dgg2cb9d9bld3v2143c3leh0qdcqi` (origin
+`https://rec-dev7.github.io` authorized there; sign-in confirmed working).
+It no longer depends on Project 1's client. The text below is the history of
+why; the old site only remains as a backup.
+
 Currently lives at `ravisankarmr-design.github.io/collegeproject/` —
 personal GitHub username in the URL, which the project owner wants gone
 for a student-facing tool. **Agreed fix, not yet done:** create a free
@@ -248,8 +257,8 @@ blocked exactly as described below.
   JavaScript origins in Google Cloud Console (APIs & Services →
   Credentials → "Web client 1") on 2026-10-03; verified afterwards that
   Google's button endpoint returns 200 for the live origin (it returned
-  403 "origin is not allowed" before). **If P3 moves to a GitHub
-  organization URL, that new origin must be added there too.**
+  403 "origin is not allowed" before). **(Superseded 2026-10-13: P3 now
+  uses the `rec-scan` client; see the UPDATE note under Hosting.)**
 - Tested headless (6/6, since the in-app browser pane can't register a
   service worker on `localhost`): no-session gate, wrong-domain
   rejection, valid sign-in, cached-session reload, fully-offline reload,

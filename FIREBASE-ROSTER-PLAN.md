@@ -201,7 +201,9 @@ that changed in this plan:
   all off). Firestore `(default)` database, **Standard edition, production
   mode, location `asia-south1` (Mumbai)** — permanent, can't be changed.
   Web app "REC Scan" registered (its config is in `app.js`).
-- **Google sign-in enabled**, with P1's OAuth client ID
+- **Google sign-in enabled**. (2026-10-13: the app now uses `rec-scan`'s own
+  client, so the P1 allowlist entry below is no longer needed and can be
+  removed.) Originally with P1's OAuth client ID
   (`194459417743-6idjf0…`) added under "Whitelist client IDs from external
   projects" so Firebase accepts the Google ID token P3's sign-in gate already
   gets. Setting confirmed to persist across a page reload.
