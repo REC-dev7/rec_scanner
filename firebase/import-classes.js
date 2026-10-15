@@ -16,6 +16,22 @@ initializeApp({ credential: cert(JSON.parse(fs.readFileSync(keyPath, 'utf8'))) }
 const db = getFirestore();
 const classes = JSON.parse(fs.readFileSync(dataPath, 'utf8'));
 
+// Rules compare the signed-in email, lowercased, against staffEmails, so a
+// mixed-case or padded entry would silently lock that teacher out. Normalise
+// here, and refuse to import anything that could not match a real staff login.
+const STAFF_EMAIL = /^[a-z0-9._-]+@rajalakshmi\.edu\.in$/;
+let bad = 0;
+for (const c of classes) {
+  const emails = (Array.isArray(c.staffEmails) ? c.staffEmails : []).map((e) => String(e).trim().toLowerCase());
+  const invalid = emails.filter((e) => !STAFF_EMAIL.test(e));
+  if (!emails.length || invalid.length) {
+    bad++;
+    console.error(`BAD ${c.classId}: ${emails.length ? 'invalid staff email(s): ' + invalid.join(', ') : 'no staffEmails'}`);
+  }
+  c.staffEmails = [...new Set(emails)];
+}
+if (bad) { console.error(`${bad} class(es) have bad staff emails; fix the JSON and re-run. Nothing was imported.`); process.exit(1); }
+
 (async () => {
   // Firestore allows 500 writes per batch; chunk so 500 staff / ~700 classes also works
   for (let i = 0; i < classes.length; i += 400) {

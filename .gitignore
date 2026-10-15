@@ -1,0 +1,9 @@
+# Secrets and private data: never commit these
+*serviceAccount*.json
+*service-account*.json
+*-key.json
+.env
+.env.*
+classes-import.json
+p3-private-data/
+node_modules/
