@@ -50,10 +50,8 @@ const FIREBASE_CONFIG = {
 const FIREBASE_SDK_VERSION = '13.0.0';
 // TEMPORARY trial class for the staff demo: a staff account with no classes of its own gets
 // this one class so there is something to scan. Needs the matching "allow get" block in
-// firebase/firestore.rules. It stops being offered, and is dropped from phones, on TRIAL_UNTIL.
+// firebase/firestore.rules. No end date: it stays until that rule block is deleted and published.
 const TRIAL_CLASS_ID = 'CB23F35__CSE_2024_Group_1';
-const TRIAL_UNTIL = '2026-10-16';
-const pastDate = (isoDay) => new Date() >= new Date(isoDay + 'T00:00:00');
 // Roll numbers are always "24" + 7 digits (e.g. 240701424) — only the first
 // two digits are fixed, the other 7 vary per year/department/student.
 // Applied to scans too, so a misread barcode can't land in the list.
@@ -930,18 +928,6 @@ function cachedClassesFor(email) {
     return c && c.email === email && Array.isArray(c.classes) ? c.classes : [];
   } catch { return []; }
 }
-// A trial class carries its own end date; once that passes it is removed from the phone, and
-// the roster is cleared too if that class was the one in use.
-function dropExpiredTrial(email) {
-  const all = cachedClassesFor(email);
-  const expired = all.filter((c) => c.trialUntil && pastDate(c.trialUntil));
-  if (!expired.length) return;
-  saveClasses(email, all.filter((c) => !expired.includes(c)));
-  if (trialActive && expired.some((c) => c.name === activeClassLabel)) {
-    roster.clear(); trialActive = false;
-    saveRoster(); saveTrialActive(); renderList();
-  }
-}
 function saveClasses(email, classes) {
   try { localStorage.setItem(CLASSES_KEY, JSON.stringify({ email, classes, syncedAt: new Date().toISOString() })); } catch { /* not critical */ }
 }
@@ -1041,13 +1027,13 @@ async function fetchClassesFromFirestore(idToken, email) {
 }
 
 // Only for an account with nothing of its own. A refusal (a student account, or the rule has
-// expired) just leaves the list empty; a network error is passed on so the retry logic runs.
+// removed) just leaves the list empty; a network error is passed on so the retry logic runs.
 async function withTrialClass(own, fetchTrial) {
-  if (own.length || pastDate(TRIAL_UNTIL)) return own;
+  if (own.length) return own;
   try {
     const cls = await fetchTrial();
     if (!cls) return own;
-    const out = [Object.assign({}, cls, { trialUntil: TRIAL_UNTIL })];
+    const out = [cls];
     out.trial = true;
     return out;
   } catch (err) {
@@ -1152,7 +1138,6 @@ function showApp(user) {
     e.preventDefault();
     if (await askConfirm('Sign out? Your classes stay saved on this phone, but you need internet to sign in again.')) signOut();
   });
-  dropExpiredTrial(user.email);
   myClasses = cachedClassesFor(user.email);
   renderClassList();
   // Ask the browser not to evict the saved classes when the phone runs low on

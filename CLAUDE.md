@@ -189,6 +189,8 @@ outright (real known class, shouldn't accept an unrelated ID). This flag
 existed for the paste-roster path too before removal; now it's Trial-Class-
 1-only.
 
+**2026-10-14: trial class has NO end date** (owner's decision; the 2026-10-16 expiry was added by the assistant, never requested). It is offered to any staff account with no classes until the `allow get` block in `firebase/firestore.rules` is deleted and published.
+
 ## Hosting / URL situation (2026-09-28/29 session)
 
 **UPDATE 2026-10-13: moved.** P3 now lives at
