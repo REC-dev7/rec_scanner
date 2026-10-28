@@ -25,9 +25,10 @@ const ALLOWED_EMAIL_DOMAIN = 'rajalakshmi.edu.in';
 // Sign-in is for staff only. Student addresses look like name.initials.YYYY.dept@college and
 // staff addresses are just name@college, so anything with a ".YYYY." batch segment before the @
 // is turned away. The owner's own account is the one student-style address let in.
-const OWNER_EMAIL = 'ravisankar.mr.2024.cse@rajalakshmi.edu.in';
+// Student-style accounts that may still sign in (the owner and his co-tester); every other student account is refused.
+const ALLOWED_STUDENT_ACCOUNTS = ['ravisankar.mr.2024.cse@rajalakshmi.edu.in', 'sherwin.gm.2024.cse@rajalakshmi.edu.in'];
 const looksLikeStudent = (email) => /[.]20[0-9][0-9][.]/.test(String(email).split('@')[0]);
-const accountAllowed = (email) => email === OWNER_EMAIL || !looksLikeStudent(email);
+const accountAllowed = (email) => ALLOWED_STUDENT_ACCOUNTS.includes(email) || !looksLikeStudent(email);
 const LOGIN_KEY = 'rollcall_user_v1';
 
 const READER_ID = 'reader';
