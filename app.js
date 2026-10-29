@@ -1242,6 +1242,16 @@ const splashEl = document.getElementById('splash');
 const elapsed = performance.now() - SPLASH_START;
 setTimeout(() => splashEl.classList.add('hide'), Math.max(0, SPLASH_MIN_MS - elapsed));
 
+// The back button keeps you on the scanner. On a pinned phone it used to step back to the load
+// screen and stay there. Every back press re-adds the entry, so back goes nowhere. Chrome skips
+// history entries made without a tap, so one more is added on the first touch.
+const stayHere = () => history.pushState({ rollcall: 1 }, '', location.href);
+stayHere();
+window.addEventListener('popstate', stayHere);
+window.addEventListener('pointerdown', stayHere, { once: true });
+// A page restored from the back/forward cache must never show the load screen again.
+window.addEventListener('pageshow', () => splashEl.classList.add('hide'));
+
 if ('serviceWorker' in navigator) {
   // Captured before registering: distinguishes "first-ever install" (no
   // prior controller, controllerchange fires once with nothing meaningful
