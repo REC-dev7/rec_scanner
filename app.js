@@ -994,6 +994,19 @@ async function selectClass(cls) {
   setClassStatus(`${prettyClass(cls.name)} selected.`, 'ok');
   if (!scanning) startScanning();
 }
+// Tapping the highlighted class again unselects it: names and the roll-number restriction go,
+// scans already taken stay on the list.
+async function deselectClass(cls) {
+  if (!(await askConfirm(`Unselect ${prettyClass(cls.name)}? Scans so far stay on the list, but names, absent tracking and the roll-number restriction go away.`))) return;
+  roster.clear();
+  trialActive = false;
+  saveRoster();
+  saveTrialActive();
+  els.rosterClearBtn.style.display = 'none';
+  renderList();
+  renderClassList();
+  setClassStatus(`${prettyClass(cls.name)} unselected. Tap it to select it again.`, 'info');
+}
 classEls.list.addEventListener('click', (e) => {
   const link = e.target.closest('a.view-students');
   if (link) {
@@ -1004,7 +1017,10 @@ classEls.list.addEventListener('click', (e) => {
     return;
   }
   const btn = e.target.closest('button.class-btn');
-  if (btn) selectClass(myClasses[Number(btn.dataset.i)]);
+  if (btn) {
+    const cls = myClasses[Number(btn.dataset.i)];
+    if (trialActive && activeClassLabel === cls.name) deselectClass(cls); else selectClass(cls);
+  }
 });
 
 // Needs internet and the Google ID token from this sign-in. The Firebase SDK is
