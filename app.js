@@ -1249,6 +1249,13 @@ const stayHere = () => history.pushState({ rollcall: 1 }, '', location.href);
 stayHere();
 window.addEventListener('popstate', stayHere);
 window.addEventListener('pointerdown', stayHere, { once: true });
+// Chrome skips history entries added before the first touch, so on a freshly pinned phone the lines above
+// are not enough. Android Chrome 120+ lets a page handle the back button directly (CloseWatcher); it works
+// without a touch. Each back press closes the watcher, and a new one is opened straight away.
+const keepBackHere = () => {
+  try { new CloseWatcher().onclose = keepBackHere; } catch { /* older browser: the history entry above is the fallback */ }
+};
+if ('CloseWatcher' in window) keepBackHere();
 // A page restored from the back/forward cache must never show the load screen again.
 window.addEventListener('pageshow', () => splashEl.classList.add('hide'));
 
