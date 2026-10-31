@@ -1256,6 +1256,22 @@ const keepBackHere = () => {
   try { new CloseWatcher().onclose = keepBackHere; } catch { /* older browser: the history entry above is the fallback */ }
 };
 if ('CloseWatcher' in window) keepBackHere();
+// Online mode: P3 stays a standalone offline page. This only opens the separate online attendance app
+// (Project 1) in a new tab, and only when there is internet, so nobody lands on a browser error page.
+const ONLINE_APP_URL = 'https://collegeproject-igj6.onrender.com/';
+(function () {
+  const status = document.getElementById('mode-status');
+  const say = (text, kind) => { status.textContent = text; status.className = `status show ${kind}`; };
+  document.getElementById('mode-offline-btn').addEventListener('click', () => say('You are already in offline mode.', 'info'));
+  document.getElementById('mode-online-btn').addEventListener('click', () => {
+    if (!navigator.onLine) { say('Online attendance needs internet. You are offline, so stay in offline mode.', 'err'); return; }
+    fetch(ONLINE_APP_URL, { mode: 'no-cors', cache: 'no-store' }).catch(() => {}); // starts waking the free server
+    const a = document.createElement('a');
+    a.href = ONLINE_APP_URL; a.target = '_blank'; a.rel = 'noopener';
+    a.click();
+    say('Opening online attendance in a new tab. If it is slow to load, the server is waking up. Come back to this tab to keep scanning offline.', 'info');
+  });
+})();
 // A page restored from the back/forward cache must never show the load screen again.
 window.addEventListener('pageshow', () => splashEl.classList.add('hide'));
 

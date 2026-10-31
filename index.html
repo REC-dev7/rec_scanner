@@ -34,6 +34,16 @@
   <p class="subtitle lockable">Scan each student's ID card barcode. It keeps scanning — the list builds itself. Export to Excel when done. Works fully offline once loaded.</p>
   <p class="footer-note lockable" id="signed-in-as" style="display:none; text-align:left; margin:0 0 14px;"></p>
 
+  <div class="card lockable" id="mode-card">
+    <p class="eyebrow">Mode</p>
+    <div class="row">
+      <button id="mode-offline-btn" class="primary" aria-pressed="true">📴 Offline scanner</button>
+      <button id="mode-online-btn" class="secondary">🌐 Online attendance</button>
+    </div>
+    <div id="mode-status" class="status"></div>
+    <p class="footer-note" style="margin:10px 0 0; text-align:left;">You are in offline mode: this page works with no internet. Online attendance opens the college's online app in a new tab and needs internet; its server can take up to 30 seconds to wake up.</p>
+  </div>
+
   <div class="card lockable" id="classes-card" style="display:none;">
     <p class="eyebrow">Your classes</p>
     <div id="class-list"></div>
